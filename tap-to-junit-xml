@@ -9,7 +9,6 @@ tap-to-junit-xml [--help|--man]
                 [--[no]hidesummary]
                 [--input <tap input file>]
                 [--output <junit output file>]
-                [--puretap]
                 [<test suite name>] [outputprefix]
 
 =head1 DESCRIPTION
@@ -87,6 +86,7 @@ Miscellaneous fixes and mods (--puretap) by Jascha Lee <jascha at yahoo-inc.com>
 
  Mar 27 2008 jm
  Mar 17 2009 jl
+        2018 bvb
 
 =head1 COPYRIGHT & LICENSE
 
@@ -104,6 +104,7 @@ use Pod::Usage;
 use TAP::Parser;
 use Time::HiRes qw(gettimeofday tv_interval);
 use XML::Generator qw(:noimport);
+use Data::Dumper;
 
 my %opts;
 pod2usage() unless GetOptions( \%opts, 'help|h',
@@ -131,7 +132,7 @@ if (defined $ARGV[0]) {
 my $HIDE_TEST_SUMMARY_REPORT = defined $opts{'hidesummary'} ? $opts{'hidesummary'} : 1;
 
 my $suite_name = $opt_suitename || 'make test';
-my $safe_suite_name = $suite_name; $safe_suite_name =~ s/[^-:_A-Za-z0-9]+/_/gs;
+my $safe_suite_name = test_make_name($suite_name);
 
 # TODO: it'd be nice to respect 'Universal desirable behavior #1' from
 # http://testanything.org/wiki/index.php/TAP_Consumers -- 'Should work on the
@@ -160,59 +161,30 @@ my $xmlgenunescaped = XML::Generator->new( escape      => 'unescaped',
                                           conformance => 'strict',
                                           pretty      => 2
                                         );
-my @properties = _get_properties($xmlgen);
-if ( defined $opts{'puretap'} ) {
-   #
-   # Instead of trying to parse everything in one pass, which fails if the
-   # testplan is last, parse through the results for the test cases and
-   # then construct the <testsuite> information from the TAP and wrap it
-   # around the test cases. Ignore 'unknown' information.  [JL]
-   #
-   my @testcases = _parse_testcases( $tap, $xmlgen );
-   errorOut( $tap, $xmlgen ) if $tap->parse_errors;
-   print $outfh $xmlgen->testsuites(
-                   $xmlgen->testsuite( { name     => $safe_suite_name,
-                                         tests    => $tap->tests_planned,
-                                         failures => scalar $tap->failed,
-                                         errors   => 0,
-                                         time     => 0,
-                                         id       => 1 },
-                                         @testcases ));
+#my @properties = _get_properties($xmlgen);
 
-}
-else {
-   my $test_results    = _parse_tests( $tap, $xmlgen );
-   if ($opt_multifile) {
-  _gen_junit_multifile_xml( $xmlgen, \@properties, $test_results );
-   } else {
-       print $outfh _get_junit_xml( $xmlgen, \@properties, $test_results );
-   }
-}
+#
+# Instead of trying to parse everything in one pass, which fails if the
+# testplan is last, parse through the results for the test cases and
+# then construct the <testsuite> information from the TAP and wrap it
+# around the test cases. Ignore 'unknown' information.  [JL]
+#
+my @testcases = _parse_testcases( $tap, $xmlgen );
+errorOut( $tap, $xmlgen ) if $tap->parse_errors;
+print $outfh $xmlgen->testsuites(
+               $xmlgen->testsuite( { name     => $safe_suite_name,
+                                     tests    => $tap->tests_planned,
+                                     failures => scalar $tap->failed,
+                                     errors   => 0,
+                                     skipped  => scalar $tap->skipped,
+                                     todo     => scalar $tap->todo,
+                                     time     => 0,
+                                     id       => 1 },
+                                     @testcases ));
+
 exit;
 
 #-------------------------------------------------------------------------------
-
-sub _get_junit_xml {
-  my ( $xmlgen, $properties, $test_results ) = @_;
-  my $xml = "<?xml version='1.0' encoding='UTF-8' ?>\n" . 
-          $xmlgen->testsuites({
-              name => $suite_name,
-            }, @$test_results);
-  return $xml;
-}
-
-sub _gen_junit_multifile_xml {
-  my ( $xmlgen, $properties, $test_results ) = @_;
-  my $count = 1;
-  foreach my $testsuite (@$test_results) {
-    open OUT, ">${opt_mfprefix}.${count}.xml"
-         or die "cannot write ${opt_mfprefix}.${count}.xml";
-    print OUT "<?xml version='1.0' encoding='UTF-8' ?>\n";
-    print OUT $testsuite;
-    close OUT;
-    $count++;
-  }
-}
 
 #
 # Wrap up parse errors and output them as test cases.
@@ -238,6 +210,8 @@ sub errorOut {
                                          tests    => $tap->tests_planned,
                                          failures => 0,
                                          errors   => scalar $tap->parse_errors,
+                                         skipped  => 0,
+                                         todo     => 0,
                                          time     => 0,
                                          id       => 1 },
                                          @errors ));
@@ -251,9 +225,10 @@ sub _parse_testcases {
    my $parser = shift;
    my $xmlgen = shift;
    return () unless $parser and $xmlgen;
-   my ($name, $directive, $xml, @testcases);
+   my ($name, $title, $directive, $description, @comment, $xml, $testcase, @testcases);
 
    while ( my $result = $parser->next ) {
+
        if ( $result->is_bailout ) {
            $xml  = $xmlgen->testcase( { name      => 'BailOut',
                                         classname => "$safe_suite_name.Tests",
@@ -265,199 +240,66 @@ sub _parse_testcases {
            push @testcases, $xml;
            last;
        }
+
+       if ( $result->is_comment ) {
+           push @comment, substr($result->as_string, 2) ."\n";
+       }
+       elsif (@comment) {
+           splice(@comment);
+       }
        next unless $result->is_test;
+       #print STDOUT Dumper($result)."\n";
+       #    print STDOUT $result->as_string ."\n";
+
        $directive = $result->directive;
-       $name = sprintf "%s%02d", 'Test_', $result->number;
-       $name .= "_$directive" if $directive;
+       $description = $result->description;
+
+       $title = sprintf "%d", $result->number;
+       $title .= " $description" if $description;
+       if ($directive) {
+           my($suffix);
+           $suffix = "$directive";
+           $suffix .= " ".$result->explanation;
+           $name = sprintf "%s.%s.%s", $safe_suite_name, test_make_name($title), test_make_name($suffix);
+       } else {
+           $name = test_name_to_classname($title);
+       }
+
        if ( $result->is_ok ) {
-           $xml = $xmlgen->testcase( { name      => $name,
-                                       classname => "$safe_suite_name.Tests",
+           $xml = $xmlgen->testcase( { name      => $title,
+                                       status    => "pass",
+                                       classname => $name,
                                        time      => 0 } );
            push @testcases, $xml;
        }
        else {
-           $xml = $xmlgen->testcase( { name      => $name,
-                                       classname => "$safe_suite_name.Tests",
+           my $msg = $result->as_string;
+           $xml = $xmlgen->testcase( { name      => $title,
+                                       classname => $name,
+                                       status    => "fail",
                                        time      => 0 },
                       $xmlgen->failure( { type    => 'TAPTestFailed',
-                                          message => $result->as_string } ));
+                                          message => $msg } ));
            push @testcases, $xml;
        }
    }
+   if (@comment) {
+
+       # TODO cant add once XML has been generated
+       # add comment lines to @testcases[-1]
+
+       my $stderr = 'system-error';
+       #print $xmlgenunescaped->$stderr(join("", @comment));
+       #print $xmlgenunescaped->$stderr(cdata(join("", @comment)));
+           #print STDOUT Dumper($xml)."\n";
+           #print STDOUT blessed( $xml );
+           #print STDOUT ref $xml;
+       #@testcases[-1]->$stderr
+       
+       splice(@comment);
+   }
 
    return @testcases;
-}
-
-sub _parse_tests {
-  my ( $parser, $xmlgen ) = @_;
-
-  my $ctx = {
-    testsuites => [ ],
-    test_name => 'notest',
-    plan_ntests => 0,
-    case_id => 0,
-  };
-
-  _new_ctx($ctx);
-
-  my $lastunk = '';
-
-  # unknown t/basic_lint.........
-  # plan 1..1
-  # comment # Running under perl version 5.008008 for linux
-  # comment # Current time local: Thu Jan 24 17:44:30 2008
-  # comment # Current time GMT:   Thu Jan 24 17:44:30 2008
-  # comment # Using Test.pm version 1.25
-  # unknown     /usr/bin/perl -T -w ../spamassassin.raw -C log/test_rules_copy  --siteconfigpath log/localrules.tmp -p log/test_default.cf  -L --lint
-  # unknown     Checking anything
-  # test ok 1
-  # test ok 2
-  # unknown t/basic_meta.........
-  # plan 1..2
-  # comment # Running under perl version 5.008008 for linux
-  # comment # Current time local: Thu Jan 24 17:44:31 2008
-  # comment # Current time GMT:   Thu Jan 24 17:44:31 2008
-  # comment # Using Test.pm version 1.25
-  # test not ok 1
-  # comment # Failed test 1 in t/basic_meta.t at line 91
-  # test ok 2
-  # unknown  Failed 1/2 subtests
-  # unknown t/basic_obj_api......
-  # plan 1..4
-  # comment # Running under perl version 5.008008 for linux
-  # comment # Current time local: Thu Jan 24 17:44:33 2008
-  # comment # Current time GMT:   Thu Jan 24 17:44:33 2008
-  # comment # Using Test.pm version 1.25
-  # test ok 1
-  # test ok 2
-  # test ok 3
-  # test ok 4
-  # test ok 9
-  # unknown
-  # unknown Test Summary Report
-  # unknown -------------------
-  # unknown t/basic_meta.t   (Wstat: 0 Tests: 2 Failed: 1)
-  # unknown   Failed test:  1
-  # unknown Files=3, Tests=7,  6 wallclock secs ( 0.01 usr  0.00 sys +  4.39 cusr  0.23 csys =  4.63 CPU)
-  # unknown Result: FAIL
-  # unknown Failed 1/3 test programs. 1/7 subtests failed.
-  # unknown make: *** [test_dynamic] Error 255
-
-  while ( my $r = $parser->next ) {
-    my $t = $r->type;
-    my $s = $r->as_string; $s =~ s/\s+$//;
-
-    # warn "JMD $t $s";
-
-    if ($t eq 'unknown') {
-      $lastunk = $s;
-
-      # PERL_DL_NONLAZY=1 /usr/bin/perl "-MExtUtils::Command::MM" "-e" "test_harness(1, 'blib/lib', 'blib/arch')" t/basic_*
-      # if ($s =~ /test_harness\(.*?\)" (.+)$/) {
-      # $suite_name = $1;
-      # }
-      if ($s =~ /^Test Summary Report$/) {
-        # create a <testsuite> block for the summary
-        $ctx->{plan_ntests} = 0;
-        $ctx->{test_name} = "Test Summary Report";
-        $ctx->{case_tests} = 1;
-        _finish_test_block($ctx);
-      }
-      elsif ($s =~ /^Result: FAIL$/) {
-        $ctx->{case_tests}++;
-        $ctx->{case_failures}++;
-        my $test_case = {
-            classname => test_name_to_classname($ctx->{test_name}),
-            name      => 'result',
-            'time'    => 0,
-        };
-        my $failure = $xmlgen->failure({
-          type => "OverallTestsFailed",
-          message => $s
-        }, "__FAILUREMESSAGETODO__");
-
-        if (!$HIDE_TEST_SUMMARY_REPORT) {
-          push @{$ctx->{test_cases}}, $xmlgen->testcase($test_case, $failure);
-        }
-      }
-      elsif ($s =~ /^(\S+?)\.\.\.+1\.\.(\d+?)\s*$/) {
-        # perl 5.6.x "Test" format plan line
-        # unknown t/basic_lint....................1..1
-
-        my ($name, $nt) = ($1,$2);
-        if ($ctx->{plan_ntests}) {       # only if there have been tests planned
-          _finish_test_block($ctx);
-        }
-
-        $ctx->{plan_ntests} = $nt+0;
-        $ctx->{test_name} = "$name.t";
-      }
-    }
-    elsif ($t eq 'plan') {
-      if ($ctx->{plan_ntests}) {       # only if there have been tests planned
-        _finish_test_block($ctx);
-      }
-
-      $ctx->{plan_ntests} = 0;
-      $s =~ /(\d+)$/ and $ctx->{plan_ntests} = $1+0;
-
-      $ctx->{test_name} = $lastunk;
-      $ctx->{test_name} =~ s/\.*\s*$//gs;
-      $ctx->{test_name} .= ".t";
-    }
-    elsif ($t eq 'test') {
-      my $ntest = 0;
-      if ($s =~ /(?:not |)\S+ (\d+)/) { $ntest = $1+0; }
-
-      if ($ntest > $ctx->{plan_ntests}) {
-        # jump in test numbers, more than planned; this is probably TAP::Parser's wierdness.
-        # (when it sees the "ok" line at the end of a test case with no number,
-        # it outputs the current total number of tests so far.)
-        next;
-      }
-
-      # clean this up in a Hudson-compatible way; ":" and "/" are out, "." also causes
-      # trouble by creating an extra "directory" in the results
-
-      my $test_case = {
-          classname => test_name_to_classname($ctx->{test_name}),
-          name      => sprintf("test %6d", $ntest), # space-padding ensures ordering
-          'time'    => 0,
-      };
-
-      $ctx->{case_tests}++;
-      my $failure = undef;
-      if ($s =~ /^not /i) {
-        $ctx->{case_failures}++;
-        $failure = $xmlgen->failure({
-          type => "TAPTestFailed",
-          message => $s
-        }, "__FAILUREMESSAGETODO__");
-        push @{$ctx->{test_cases}}, $xmlgen->testcase($test_case, $failure);
-      }
-      else {
-        push @{$ctx->{test_cases}}, $xmlgen->testcase($test_case);
-      }
-    }
-      
-    $ctx->{sysout} .= $s."\n";
-  }
-
-  if (scalar(@{$ctx->{test_cases}}) == 0 &&
-      scalar(@{$ctx->{testsuites}}) == 0)
-  { 
-    # no tests found! create a <testsuite> block containing *something* at least
-    $ctx->{case_tests}++;
-    my $test_case = {
-        classname => test_name_to_classname($ctx->{test_name}),
-        name      => 'result',
-        'time'    => 0,
-    };
-    push @{$ctx->{test_cases}}, $xmlgen->testcase($test_case);
-  }
-
-  _finish_test_block($ctx);
-  return $ctx->{testsuites};
 }
 
 sub _new_ctx {
@@ -471,47 +313,6 @@ sub _new_ctx {
   $ctx->{sysout} = '';
   return $ctx;
 }
-
-sub _finish_test_block {
-  my $ctx = shift;
-  $ctx->{sysout} =~ s/\n\S+\.*\s*\n$/\n/s;       # remove next test's "t/foo....." line
-
-  my $elapsed_time = 0;     # TODO
-  #my $elapsed_time = tv_interval( $ctx->{start_time}, [gettimeofday] );
-
-  # clean it up to valid Java packagename format (or at least something Hudson will
-  # consume)
-  my $name = $ctx->{test_name};
-  $name =~ s/[^-:_A-Za-z0-9]+/_/gs;
-  $name = "$safe_suite_name.$name";      # a "directory" for the suite name
-
-  my $testsuite = {
-      'time'         => $elapsed_time,
-      'name'         => $name,
-      tests          => $ctx->{case_tests},
-      failures       => $ctx->{case_failures},
-      'id'           => $ctx->{case_id},
-      errors         => 0,
-  };
-
-  my @fixedcases = ();
-  foreach my $tc (@{$ctx->{test_cases}}) {
-    if ($tc =~ s/__FAILUREMESSAGETODO__/ cdata($ctx->{sysout}) /ges) {
-      push @fixedcases, \$tc;       # inhibits escaping!
-    } else {
-      push @fixedcases, $tc;
-    }
-  }
-
-  # use "unescaped"; we have already fixed escaping on these strings.
-  # note that a reference means 'this is unescaped', bizarrely.
-  push @{$ctx->{testsuites}}, $xmlgenunescaped->testsuite($testsuite,
-          @fixedcases,
-          \("<system-out>\n".cdata($ctx->{sysout})."\n</system-out>"),
-          \("<system-err />"));
-
-  _new_ctx($ctx);
-};
 
 sub cdata {
   my $s = shift;
@@ -528,11 +329,18 @@ sub _get_properties {
     return @props;
 }
 
+sub test_make_name {
+  my $safe = shift;
+  #        s/[^-:_A-Za-z0-9]+/_/gs;
+  $safe =~ s/[^A-Za-z0-9\.]+/-/g;
+  $safe =~ s/([\-\.])[\-\.]+/$1/g;
+  $safe;
+}
+
 sub test_name_to_classname {
   my $safe = shift;
-  $safe =~ s/[^-:_A-Za-z0-9]+/_/gs;
-  $safe = "$safe_suite_name.$safe";      # a "directory" for the suite name
-  $safe;
+  $safe = test_make_name($safe);
+  "$safe_suite_name.$safe";
 }
 
 __END__
